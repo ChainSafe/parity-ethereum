@@ -23,7 +23,7 @@ use std::{
 use common_types::{
 	BlockNumber,
 	header::Header,
-	errors::{BlockError, EthcoreError as Error, EngineError},
+	errors::{BlockError, BlockErrorWithData, EthcoreError as Error, EngineError},
 };
 use ethereum_types::{Address, H64};
 use log::{debug, trace};
@@ -137,30 +137,36 @@ impl CliqueBlockState {
 		// The signer is not authorized
 		if !self.signers.contains(&creator) {
 			trace!(target: "engine", "current state: {}", self);
-			Err(EngineError::NotAuthorized(creator))?
+			return Err(EngineError::NotAuthorized(creator).into());
 		}
 
 		// The signer has signed a block too recently
 		if self.recent_signers.contains(&creator) {
 			trace!(target: "engine", "current state: {}", self);
-			Err(EngineError::CliqueTooRecentlySigned(creator))?
+			return Err(EngineError::CliqueTooRecentlySigned(creator).into());
 		}
 
 		// Wrong difficulty
 		let inturn = self.is_inturn(header.number(), &creator);
 
 		if inturn && *header.difficulty() != DIFF_INTURN {
-			Err(BlockError::InvalidDifficulty(Mismatch {
-				expected: DIFF_INTURN,
-				found: *header.difficulty(),
-			}))?
+			return Err(Error::Block(BlockErrorWithData {
+				error: BlockError::InvalidDifficulty(Mismatch {
+					expected: DIFF_INTURN,
+					found: *header.difficulty(),
+				}),
+				data: None,
+			}));
 		}
 
 		if !inturn && *header.difficulty() != DIFF_NOTURN {
-			Err(BlockError::InvalidDifficulty(Mismatch {
-				expected: DIFF_NOTURN,
-				found: *header.difficulty(),
-			}))?
+			return Err(Error::Block(BlockErrorWithData {
+				error: BlockError::InvalidDifficulty(Mismatch {
+					expected: DIFF_NOTURN,
+					found: *header.difficulty(),
+				}),
+				data: None,
+			}));
 		}
 
 		Ok(creator)
@@ -178,9 +184,10 @@ impl CliqueBlockState {
 			if self.signers != signers {
 				let invalid_signers: Vec<String> = signers.into_iter()
 					.filter(|s| !self.signers.contains(s))
-					.map(|s| format!("{}", s))
+					.map(|s| s.to_string())
 					.collect();
-				Err(EngineError::CliqueFaultyRecoveredSigners(invalid_signers))?
+
+				return Err(EngineError::CliqueFaultyRecoveredSigners(invalid_signers).into())
 			};
 
 			// TODO(niklasad1): I'm not sure if we should shrink here because it is likely that next epoch
@@ -196,7 +203,13 @@ impl CliqueBlockState {
 		if *header.author() != NULL_AUTHOR {
 			let decoded_seal = header.decode_seal::<Vec<_>>()?;
 			if decoded_seal.len() != 2 {
-				Err(BlockError::InvalidSealArity(Mismatch { expected: 2, found: decoded_seal.len() }))?
+				return Err(Error::Block(BlockErrorWithData {
+					error: BlockError::InvalidSealArity(Mismatch {
+						expected: 2,
+						found: decoded_seal.len()
+					}),
+					data: None,
+				}));
 			}
 
 			let nonce = H64::from_slice(decoded_seal[1]);
@@ -272,7 +285,7 @@ impl CliqueBlockState {
 	// TODO(niklasad1): refactor this method to be in constructor of `CliqueBlockState` instead.
 	// This is a quite bad API because we must mutate both variables even when already `inturn` fails
 	// That's why we can't return early and must have the `if-else` in the end
-	pub fn calc_next_timestamp(&mut self, timestamp: u64, period: u64) -> Result<(), Error> {
+	pub fn calc_next_timestamp(&mut self, timestamp: u64, period: u64) -> Result<(), BlockError> {
 		let inturn = CheckedSystemTime::checked_add(UNIX_EPOCH, Duration::from_secs(timestamp.saturating_add(period)));
 
 		self.next_timestamp_inturn = inturn;
@@ -286,7 +299,7 @@ impl CliqueBlockState {
 		if self.next_timestamp_inturn.is_some() && self.next_timestamp_noturn.is_some() {
 			Ok(())
 		} else {
-			Err(BlockError::TimestampOverflow)?
+			Err(BlockError::TimestampOverflow)
 		}
 	}
 

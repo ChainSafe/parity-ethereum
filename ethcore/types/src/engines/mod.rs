@@ -54,19 +54,17 @@ pub struct EthashSeal {
 
 impl EthashSeal {
 	/// Tries to parse rlp encoded bytes as an Ethash/Clique seal.
-	pub fn parse_seal<T: AsRef<[u8]>>(seal: &[T]) -> Result<Self, EthcoreError> {
+	pub fn parse_seal<T: AsRef<[u8]>>(seal: &[T]) -> Result<Self, BlockError> {
 		if seal.len() != 2 {
-			return Err(BlockError::InvalidSealArity(
-				Mismatch {
-					expected: 2,
-					found: seal.len()
-				}
-			).into());
+			Err(BlockError::InvalidSealArity(Mismatch {
+				expected: 2,
+				found: seal.len()
+			}))
+		} else {
+			let mix_hash = Rlp::new(seal[0].as_ref()).as_val::<H256>().unwrap();
+			let nonce = Rlp::new(seal[1].as_ref()).as_val::<H64>().unwrap();
+			Ok(EthashSeal { mix_hash, nonce })
 		}
-
-		let mix_hash = Rlp::new(seal[0].as_ref()).as_val::<H256>()?;
-		let nonce = Rlp::new(seal[1].as_ref()).as_val::<H64>()?;
-		Ok(EthashSeal { mix_hash, nonce })
 	}
 }
 

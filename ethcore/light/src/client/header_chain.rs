@@ -37,7 +37,7 @@ use common_types::{
 		Transition as EpochTransition,
 		PendingTransition as PendingEpochTransition,
 	},
-	errors::{EthcoreError as Error, BlockError, EthcoreResult},
+	errors::{EthcoreError as Error, BlockError, BlockErrorWithData, EthcoreResult},
 	header::Header,
 	ids::BlockId,
 };
@@ -420,8 +420,10 @@ impl HeaderChain {
 						candidates.get(&(number - 1))
 							.and_then(|entry| entry.candidates.iter().find(|c| c.hash == parent_hash))
 							.map(|c| c.total_difficulty)
-							.ok_or_else(|| BlockError::UnknownParent(parent_hash))
-							.map_err(Error::Block)?
+							.ok_or_else(|| Error::Block(BlockErrorWithData {
+								error: BlockError::UnknownParent(parent_hash),
+								data: None
+							}))?
 					};
 
 				parent_td + *header.difficulty()

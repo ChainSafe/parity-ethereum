@@ -119,7 +119,7 @@ use types::{
 		MAX_UNCLE_AGE,
 		SealingState,
 	},
-	errors::{BlockError, EngineError, EthcoreError, EthcoreResult, ExecutionError, ImportError, SnapshotError},
+	errors::{BlockError, BlockErrorWithData, EngineError, EthcoreError, EthcoreResult, ExecutionError, ImportError, SnapshotError},
 	filter::Filter,
 	header::Header,
 	ids::{BlockId, TraceId, TransactionId, UncleId},
@@ -385,20 +385,23 @@ impl Importer {
 
 		let chain = client.chain.read();
 		// Verify Block Family
-		let verify_family_result = verification::verify_block_family(
+		let verified_block_result = verification::verify_block_family(
 			&header,
 			&parent,
 			engine,
-			verification::FullFamilyParams {
-				block: &block,
-				block_provider: &**chain,
-				client
-			},
+			block,
+			&**chain,
+			client
 		);
 
-		if let Err(e) = verify_family_result {
-			warn!(target: "client", "Stage 3 block verification failed for #{} ({})\nError: {:?}", header.number(), header.hash(), e);
-			return Err(e);
+		let verified_block = match verified_block_result {
+			Ok(verified_block) => verified_block,
+			Err(e) => {
+				warn!(target: "client", "Stage 3 block verification failed for #{} ({})\nError: {:?}",
+					header.number(), header.hash(), e
+				);
+				return Err(e);
+			}
 		};
 
 		let verify_external_result = engine.verify_block_external(&header);
@@ -414,7 +417,7 @@ impl Importer {
 		let is_epoch_begin = chain.epoch_transition(parent.number(), *header.parent_hash()).is_some();
 
 		let enact_result = enact_verified(
-			block,
+			verified_block,
 			engine,
 			client.tracedb.read().tracing_enabled(),
 			db,
@@ -442,9 +445,10 @@ impl Importer {
 		}
 
 		// Final Verification
-		if let Err(e) = verification::verify_block_final(&header, &locked_block.header) {
-			warn!(target: "client", "Stage 5 block verification failed for #{} ({})\nError: {:?}", header.number(), header.hash(), e);
-			return Err(e);
+		if let Err(error) = verification::verify_block_final(&header, &locked_block.header) {
+			warn!(target: "client", "Stage 5 block verification failed for #{} ({})\nError: {:?}",
+				header.number(), header.hash(), error);
+			return Err(EthcoreError::Block(BlockErrorWithData { error, data: None }));
 		}
 
 		let pending = self.check_epoch_end_signal(
@@ -1450,7 +1454,10 @@ impl ImportBlock for Client {
 
 		let status = self.block_status(BlockId::Hash(unverified.parent_hash()));
 		if status == BlockStatus::Unknown {
-			return Err(EthcoreError::Block(BlockError::UnknownParent(unverified.parent_hash())));
+			return Err(EthcoreError::Block(BlockErrorWithData {
+				error: BlockError::UnknownParent(unverified.parent_hash()),
+				data: Some(unverified.bytes)
+			}));
 		}
 
 		let raw = if self.importer.block_queue.is_empty() {
@@ -1467,15 +1474,11 @@ impl ImportBlock for Client {
 				Ok(hash)
 			},
 			// we only care about block errors (not import errors)
-			Err((EthcoreError::Block(e), Some(input))) => {
-				self.importer.bad_blocks.report(input.bytes, e.to_string());
-				Err(EthcoreError::Block(e))
+			Err(EthcoreError::Block(err)) => {
+				self.importer.bad_blocks.report(err.data.clone().unwrap_or_default(), err.error.to_string());
+				Err(EthcoreError::Block(err))
 			},
-			Err((EthcoreError::Block(e), None)) => {
-				error!(target: "client", "BlockError {} detected but it was missing raw_bytes of the block", e);
-				Err(EthcoreError::Block(e))
-			}
-			Err((e, _input)) => Err(e),
+			err => err,
 		}
 	}
 
@@ -2226,7 +2229,10 @@ impl IoClient for Client {
 			// (and attempt to acquire lock)
 			let is_parent_pending = self.queued_ancient_blocks.read().0.contains(&parent_hash);
 			if !is_parent_pending && !self.chain.read().is_known(&parent_hash) {
-				return Err(EthcoreError::Block(BlockError::UnknownParent(parent_hash)));
+				return Err(EthcoreError::Block(BlockErrorWithData {
+					error: BlockError::UnknownParent(parent_hash),
+					data: Some(unverified.bytes)
+				}));
 			}
 		}
 

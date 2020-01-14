@@ -28,14 +28,13 @@ use common_types::{
 		OptimizeFor,
 		params::CommonParams,
 	},
-	errors::{BlockError, EthcoreError as Error},
+	errors::{BlockError, BlockErrorWithData, EthcoreError as Error},
 	snapshot::Snapshotting,
 };
 use engine::Engine;
 use ethereum_types::{H256, U256};
-use ethjson;
 use ethash::{self, quick_get_difficulty, slow_hash_block_number, EthashManager};
-use keccak_hash::{KECCAK_EMPTY_LIST_RLP};
+use keccak_hash::KECCAK_EMPTY_LIST_RLP;
 use log::trace;
 use macros::map;
 use machine::{
@@ -177,28 +176,35 @@ impl Ethash {
 	}
 }
 
-fn verify_block_unordered(pow: &Arc<EthashManager>, header: &Header) -> Result<(), Error> {
+fn verify_block_unordered(pow: &Arc<EthashManager>, header: &Header) -> Result<(), BlockError> {
 	let seal = EthashSeal::parse_seal(header.seal())?;
 
 	let result = pow.compute_light(
-		header.number() as u64,
+		header.number(),
 		&header.bare_hash().0,
 		seal.nonce.to_low_u64_be()
 	);
 	let mix = H256(result.mix_hash);
 	let difficulty = ethash::boundary_to_difficulty(&H256(result.value));
 	trace!(target: "miner", "num: {num}, seed: {seed}, h: {h}, non: {non}, mix: {mix}, res: {res}",
-	       num = header.number() as u64,
-	       seed = H256(slow_hash_block_number(header.number() as u64)),
+	       num = header.number(),
+	       seed = H256(slow_hash_block_number(header.number())),
 	       h = header.bare_hash(),
 	       non = seal.nonce.to_low_u64_be(),
 	       mix = H256(result.mix_hash),
 	       res = H256(result.value));
 	if mix != seal.mix_hash {
-		return Err(From::from(BlockError::MismatchedH256SealElement(Mismatch { expected: mix, found: seal.mix_hash })));
+		return Err(BlockError::MismatchedH256SealElement(Mismatch {
+			expected: mix,
+			found: seal.mix_hash
+		}));
 	}
 	if &difficulty < header.difficulty() {
-		return Err(From::from(BlockError::InvalidProofOfWork(OutOfBounds { min: Some(header.difficulty().clone()), max: None, found: difficulty })));
+		return Err(BlockError::InvalidProofOfWork(OutOfBounds {
+			min: Some(*header.difficulty()),
+			max: None,
+			found: difficulty
+		}));
 	}
 	Ok(())
 }
@@ -219,6 +225,7 @@ struct EpochVerifier {
 impl engine::EpochVerifier for EpochVerifier {
 	fn verify_heavy(&self, header: &Header) -> Result<(), Error> {
 		verify_block_unordered(&self.pow, header)
+			.map_err(|error| Error::Block(BlockErrorWithData { error, data: None }))
 	}
 }
 
@@ -234,8 +241,8 @@ impl Engine for Ethash {
 	fn extra_info(&self, header: &Header) -> BTreeMap<String, String> {
 		match EthashSeal::parse_seal(header.seal()) {
 			Ok(seal) => map![
-				"nonce".to_owned() => format!("0x{:x}", seal.nonce),
-				"mixHash".to_owned() => format!("0x{:x}", seal.mix_hash)
+				"nonce".to_owned() => format!("{:#x}", seal.nonce),
+				"mixHash".to_owned() => format!("{:#x}", seal.mix_hash)
 			],
 			_ => BTreeMap::default()
 		}
@@ -322,12 +329,21 @@ impl Engine for Ethash {
 
 	fn verify_block_basic(&self, header: &Header) -> Result<(), Error> {
 		// check the seal fields.
-		let seal = EthashSeal::parse_seal(header.seal())?;
+		let seal = EthashSeal::parse_seal(header.seal())
+			.map_err(|error| Error::Block(BlockErrorWithData { error, data: None }))?;
 
 		// TODO: consider removing these lines.
 		let min_difficulty = self.ethash_params.minimum_difficulty;
 		if header.difficulty() < &min_difficulty {
-			return Err(From::from(BlockError::DifficultyOutOfBounds(OutOfBounds { min: Some(min_difficulty), max: None, found: header.difficulty().clone() })))
+			// TODO(niklasad1): we could use `From::from` but use explicitness here for clarify reasons
+			return Err(Error::Block(BlockErrorWithData {
+				error: BlockError::DifficultyOutOfBounds(OutOfBounds {
+					min: Some(min_difficulty),
+					max: None,
+					found: *header.difficulty()
+				}),
+				data: None,
+			}));
 		}
 
 		let difficulty = ethash::boundary_to_difficulty(&H256(quick_get_difficulty(
@@ -338,26 +354,46 @@ impl Engine for Ethash {
 		)));
 
 		if &difficulty < header.difficulty() {
-			return Err(From::from(BlockError::InvalidProofOfWork(OutOfBounds { min: Some(header.difficulty().clone()), max: None, found: difficulty })));
+			return Err(Error::Block(BlockErrorWithData {
+				error: BlockError::InvalidProofOfWork(OutOfBounds {
+					min: Some(*header.difficulty()),
+					max: None,
+					found: difficulty
+				}),
+				data: None,
+			}));
 		}
-
 		Ok(())
 	}
 
 	fn verify_block_unordered(&self, header: &Header) -> Result<(), Error> {
 		verify_block_unordered(&self.pow, header)
+			.map_err(|error| From::from(BlockErrorWithData { error, data: None }))
 	}
 
 	fn verify_block_family(&self, header: &Header, parent: &Header) -> Result<(), Error> {
 		// we should not calculate difficulty for genesis blocks
 		if header.number() == 0 {
-			return Err(From::from(BlockError::RidiculousNumber(OutOfBounds { min: Some(1), max: None, found: header.number() })));
+			return Err(Error::Block(BlockErrorWithData {
+				error: BlockError::RidiculousNumber(OutOfBounds {
+					min: Some(1),
+					max: None,
+					found: header.number()
+				}),
+				data: None,
+			}));
 		}
 
 		// Check difficulty is correct given the two timestamps.
 		let expected_difficulty = self.calculate_difficulty(header, parent);
 		if header.difficulty() != &expected_difficulty {
-			return Err(From::from(BlockError::InvalidDifficulty(Mismatch { expected: expected_difficulty, found: header.difficulty().clone() })))
+			return Err(Error::Block(BlockErrorWithData {
+				error: BlockError::InvalidDifficulty(Mismatch {
+					expected: expected_difficulty,
+					found: *header.difficulty()
+				}),
+				data: None,
+			}));
 		}
 
 		Ok(())

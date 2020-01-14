@@ -50,7 +50,7 @@ use hash::keccak;
 use rlp::{RlpStream, Encodable, encode_list};
 use types::{
 	block::PreverifiedBlock,
-	errors::{EthcoreError as Error, BlockError},
+	errors::{EthcoreError as Error, BlockError, BlockErrorWithData},
 	transaction::{SignedTransaction, Error as TransactionError},
 	header::Header,
 	receipt::{Receipt, TransactionOutcome},
@@ -176,7 +176,7 @@ impl<'x> OpenBlock<'x> {
 		let env_info = self.block.env_info();
 		let outcome = self.block.state.apply(&env_info, self.engine.machine(), &t, self.block.traces.is_enabled())?;
 
-		self.block.transactions_set.insert(h.unwrap_or_else(||t.hash()));
+		self.block.transactions_set.insert(h.unwrap_or_else(|| t.hash()));
 		self.block.transactions.push(t.into());
 		if let Tracing::Enabled(ref mut traces) = self.block.traces {
 			traces.push(outcome.trace.into());
@@ -343,10 +343,14 @@ impl LockedBlock {
 		let expected_seal_fields = engine.seal_fields(&self.header);
 		let mut s = self;
 		if seal.len() != expected_seal_fields {
-			Err(BlockError::InvalidSealArity(Mismatch {
-				expected: expected_seal_fields,
-				found: seal.len()
-			}))?;
+			// TODO(niklasad1): return block error here?!
+			return Err(Error::Block(BlockErrorWithData {
+				error: BlockError::InvalidSealArity(Mismatch {
+					expected: expected_seal_fields,
+					found: seal.len()
+				}),
+				data: None
+			}));
 		}
 
 		s.block.header.set_seal(seal);
@@ -417,7 +421,12 @@ pub(crate) fn enact(
 ) -> Result<LockedBlock, Error> {
 	// For trace log
 	let trace_state = if log_enabled!(target: "enact", ::log::Level::Trace) {
-		Some(State::from_existing(db.boxed_clone(), parent.state_root().clone(), engine.account_start_nonce(parent.number() + 1), factories.clone())?)
+		Some(State::from_existing(
+			db.boxed_clone(),
+			*parent.state_root(),
+			engine.account_start_nonce(parent.number() + 1),
+			factories.clone()
+		)?)
 	} else {
 		None
 	};
@@ -449,7 +458,7 @@ pub(crate) fn enact(
 	b.push_transactions(transactions)?;
 
 	for u in uncles {
-		b.push_uncle(u)?;
+		b.push_uncle(u).map_err(|error| Error::Block(BlockErrorWithData { error, data: None }))?;
 	}
 
 	b.close_and_lock()
@@ -525,7 +534,7 @@ mod tests {
 
 		{
 			if ::log::max_level() >= ::log::Level::Trace {
-				let s = State::from_existing(db.boxed_clone(), parent.state_root().clone(), engine.account_start_nonce(parent.number() + 1), factories.clone())?;
+				let s = State::from_existing(db.boxed_clone(), *parent.state_root(), engine.account_start_nonce(parent.number() + 1), factories.clone())?;
 				trace!(target: "enact", "num={}, root={}, author={}, author_balance={}\n",
 					header.number(), s.root(), header.author(), s.balance(&header.author())?);
 			}
